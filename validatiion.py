@@ -7,7 +7,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
-# Ignore convergence warnings for clean output
 warnings.filterwarnings("ignore")
 
 def prepare_clinical_data(df_raw):

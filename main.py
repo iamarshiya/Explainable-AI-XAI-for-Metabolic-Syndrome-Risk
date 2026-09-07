@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
@@ -41,6 +42,8 @@ def main():
     print("\n2. Training Random Forest Model...")
     rf_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
     rf_model.fit(X_train, y_train)
+    joblib.dump(rf_model, "model.pkl")
+    print("Model saved successfully as model.pkl!")
 
     # Evaluate
     y_pred = rf_model.predict(X_test)
