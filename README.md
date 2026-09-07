@@ -36,16 +36,22 @@ Explainable-AI-XAI-for-Metabolic-Syndrome-Risk/
 **Clone the Repository:**
 
 **Bash**
+
 git clone [https://github.com/iamarshiya/Explainable-AI-XAI-for-Metabolic-Syndrome-Risk.git](https://github.com/iamarshiya/Explainable-AI-XAI-for-Metabolic-Syndrome-Risk.git)
 cd Explainable-AI-XAI-for-Metabolic-Syndrome-Risk
 Create and Activate a Virtual Environment:
 python -m venv venv
+
 **On Windows:**
+
 venv\Scripts\activate
+
 **On macOS/Linux:**
+
 source venv/bin/activate
 
-Install Dependencies:
+**Install Dependencies:**
+
 pip install pandas numpy scikit-learn matplotlib seaborn shap lime reportlab streamlit joblib
 
 # How to Run the Application
