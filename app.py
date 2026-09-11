@@ -2,234 +2,132 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import shap
 import os
-import base64
+from google import genai
+from google.genai import types
 
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+# Page Configuration for Glassmorphic UI Theme
+st.set_page_config(
+    page_title="Metabolic Syndrome XAI & CDSS",
+    page_icon="🧬",
+    layout="wide"
+)
 
-# -----------------------------------------
-# 1. Page Configuration & Custom CSS
-# -----------------------------------------
-st.set_page_config(page_title="MetaRisk XAI", page_icon="🧬", layout="wide")
+# Load Trained Random Forest Model and Dataset
+@st.cache_resource
+def load_assets():
+    model = joblib.load("model.pkl")
+    data_dir = "data"
+    df_demo = pd.read_sas(os.path.join(data_dir, "DEMO_J.xpt"))[['SEQN', 'RIDAGEYR']]
+    df_bmx = pd.read_sas(os.path.join(data_dir, "BMX_J.xpt"))[['SEQN', 'BMXBMI']]
+    df_bpx = pd.read_sas(os.path.join(data_dir, "BPX_J.xpt"))[['SEQN', 'BPXSY1']]
+    df_glu = pd.read_sas(os.path.join(data_dir, "GLU_J.xpt"))[['SEQN', 'LBXGLU']]
+    df_ins = pd.read_sas(os.path.join(data_dir, "INS_J.xpt"))[['SEQN', 'LBXIN']]
 
-# Injecting Custom CSS for a Glassmorphic, Modern UI
-st.markdown("""
-    <style>
-    /* Main Background */
-    .stApp {
-        background-color: #0f172a;
-        color: #f8fafc;
-    }
-    
-    /* Sidebar Styling */
-    [data-testid="stSidebar"] {
-        background-color: rgba(30, 41, 59, 0.7) !important;
-        backdrop-filter: blur(12px);
-        border-right: 1px solid rgba(255, 255, 255, 0.1);
-    }
-    
-    /* Fancy Button Styling */
-    div.stButton > button {
-        background: linear-gradient(135deg, #0d9488 0%, #14b8a6 100%);
-        color: white;
-        border-radius: 8px;
-        border: none;
-        padding: 10px 24px;
-        font-weight: 600;
-        transition: all 0.3s ease;
-        width: 100%;
-    }
-    div.stButton > button:hover {
-        background: linear-gradient(135deg, #14b8a6 0%, #38bdf8 100%);
-        box-shadow: 0 4px 15px rgba(20, 184, 166, 0.4);
-        transform: translateY(-1px);
-    }
-    
-    /* Custom Glassmorphic Cards for Results */
-    .glass-card {
-        background: rgba(30, 41, 59, 0.6);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 12px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-    }
-    
-    .highlight-text {
-        color: #38bdf8;
-        font-weight: bold;
-    }
-    </style>
-""", unsafe_allow_html=True)
+    df_merged = df_demo.merge(df_bmx, on='SEQN', how='inner')\
+                       .merge(df_bpx, on='SEQN', how='inner')\
+                       .merge(df_glu, on='SEQN', how='inner')\
+                       .merge(df_ins, on='SEQN', how='left')
 
-# -----------------------------------------
-# 2. Header & UI Layout
-# -----------------------------------------
-col_logo, col_title = st.columns([1, 8])
-with col_title:
-    st.title("🧬 MetaRisk XAI Dashboard")
-    st.markdown("*Clinical Explainable AI Diagnostic & Reporting System*")
+    df_merged.rename(columns={
+        'RIDAGEYR': 'Age',
+        'BMXBMI': 'BMI',
+        'BPXSY1': 'BloodPressure', 
+        'LBXGLU': 'Glucose',
+        'LBXIN': 'Insulin'
+    }, inplace=True)
+    
+    df_merged['Outcome'] = (df_merged['Glucose'] >= 126.0).astype(int)
+    
+    cols_to_fill = ['Glucose', 'BloodPressure', 'Insulin', 'BMI', 'Age']
+    for col in cols_to_fill:
+        df_merged[col] = df_merged[col].replace(0, np.nan)
+        df_merged[col] = df_merged[col].fillna(df_merged.groupby('Outcome')[col].transform('median'))
+        df_merged[col] = df_merged[col].fillna(df_merged[col].median())
+        
+    eps = 1e-6
+    df_merged['Glucose_BMI_interaction'] = df_merged['Glucose'] * df_merged['BMI']
+    df_merged['Insulin_Glucose_ratio'] = df_merged['Insulin'] / (df_merged['Glucose'] + eps)
+    df_merged['BP_Age_ratio'] = df_merged['BloodPressure'] / (df_merged['Age'] + eps)
+    
+    return model, df_merged
+
+model, df_data = load_assets()
+
+# Sidebar: Patient Selection & API Configuration
+st.sidebar.header("Configuration")
+patient_idx = st.sidebar.number_input("Select Patient Row Index", min_value=0, max_value=len(df_data)-1, value=5)
+api_key_input = st.sidebar.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
+
+features_to_drop = ['Outcome', 'Glucose', 'Glucose_BMI_interaction', 'Insulin_Glucose_ratio', 'SEQN']
+X_full = df_data.drop(columns=features_to_drop)
+selected_patient_row = X_full.iloc[patient_idx]
+actual_outcome = df_data.iloc[patient_idx]['Outcome']
+
+# Main Dashboard Header
+st.title("🧬 Explainable AI Clinical Decision Support System")
+st.markdown("### Metabolic Syndrome Risk Prediction & Generative Narrative Layer")
 st.markdown("---")
 
-# -----------------------------------------
-# 3. Model Loading
-# -----------------------------------------
-@st.cache_resource
-def load_model():
-    if os.path.exists("model.pkl"):
-        return joblib.load("model.pkl")
-    return None
+# Display Vitals Metrics Row
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Age (Years)", int(selected_patient_row['Age']))
+col2.metric("BMI", round(selected_patient_row['BMI'], 1))
+col3.metric("Blood Pressure", int(selected_patient_row['BloodPressure']))
+col4.metric("Insulin", round(selected_patient_row['Insulin'], 1))
+col5.metric("Actual Status", "High Risk" if actual_outcome == 1 else "Low Risk")
 
-model = load_model()
+st.markdown("---")
 
-if model is None:
-    st.error("⚠️ Model file 'model.pkl' not found! Please run your main.py training script first.")
-    st.stop()
+# Model Inference & Risk Scoring
+patient_df_reshaped = pd.DataFrame([selected_patient_row])
+risk_proba = model.predict_proba(patient_df_reshaped)[0][1]
 
-# -----------------------------------------
-# 4. Sidebar: Patient Inputs
-# -----------------------------------------
-st.sidebar.header("📋 Patient Vitals Entry")
-st.sidebar.markdown("Enter clinical parameters below:")
-
-pregnancies = st.sidebar.number_input("Pregnancies", min_value=0.0, max_value=20.0, value=1.0)
-glucose = st.sidebar.slider("Plasma Glucose (mg/dL)", 0.0, 300.0, 120.0)
-bp = st.sidebar.slider("Blood Pressure (mm Hg)", 0.0, 200.0, 70.0)
-skin = st.sidebar.slider("Skin Thickness (mm)", 0.0, 100.0, 20.0)
-insulin = st.sidebar.slider("Serum Insulin (mu U/ml)", 0.0, 900.0, 85.0)
-bmi = st.sidebar.slider("Body Mass Index (BMI)", 0.0, 70.0, 25.5)
-dpf = st.sidebar.number_input("Diabetes Pedigree Function", 0.0, 3.0, 0.5)
-age = st.sidebar.slider("Age (Years)", 1.0, 120.0, 30.0)
-
-# -----------------------------------------
-# 5. Main Application Logic
-# -----------------------------------------
-# Layout Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Diagnostic Results", "🧠 XAI Feature Engineering", "📄 Generate Report"])
-
-# Trigger Analysis
-if st.sidebar.button("Run AI Diagnostic 🚀"):
-    
-    # 5a. Data Preparation & Engineering
-    input_data = {
-        'Pregnancies': pregnancies, 'Glucose': glucose, 'BloodPressure': bp,
-        'SkinThickness': skin, 'Insulin': insulin, 'BMI': bmi,
-        'DiabetesPedigreeFunction': dpf, 'Age': age
-    }
-    df_input = pd.DataFrame([input_data])
-    
-    eps = 1e-6
-    df_input['Glucose_BMI_interaction'] = df_input['Glucose'] * df_input['BMI']
-    df_input['Insulin_Glucose_ratio'] = df_input['Insulin'] / (df_input['Glucose'] + eps)
-    df_input['Genetic_Age_exposure'] = df_input['DiabetesPedigreeFunction'] * df_input['Age']
-    df_input['BP_Age_ratio'] = df_input['BloodPressure'] / (df_input['Age'] + eps)
-    
-    features = [
-        'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 
-        'BMI', 'DiabetesPedigreeFunction', 'Age', 
-        'Glucose_BMI_interaction', 'Insulin_Glucose_ratio', 
-        'Genetic_Age_exposure', 'BP_Age_ratio'
-    ]
-    X_pred = df_input[features]
-    
-    # 5b. Inference
-    prob = model.predict_proba(X_pred)[0][1]
-    prediction = int(model.predict(X_pred)[0])
-    
-    # -----------------------------------------
-    # Tab 1: Diagnostic Results
-    # -----------------------------------------
-    with tab1:
-        st.markdown("<br>", unsafe_allow_html=True)
-        col_res1, col_res2 = st.columns(2)
-        
-        with col_res1:
-            if prediction == 1:
-                st.markdown(f"""
-                <div class="glass-card" style="border-left: 4px solid #ef4444;">
-                    <h3 style="color: #f87171; margin-top: 0;">High Risk Detected</h3>
-                    <h1 style="font-size: 3rem; margin: 10px 0;">{prob*100:.1f}%</h1>
-                    <p style="color: #cbd5e1;">Probability of Metabolic Syndrome / Diabetes</p>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                <div class="glass-card" style="border-left: 4px solid #10b981;">
-                    <h3 style="color: #34d399; margin-top: 0;">Low Risk Assessment</h3>
-                    <h1 style="font-size: 3rem; margin: 10px 0;">{prob*100:.1f}%</h1>
-                    <p style="color: #cbd5e1;">Probability of Metabolic Syndrome / Diabetes</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-        with col_res2:
-            st.markdown(f"""
-            <div class="glass-card">
-                <h4 style="margin-top:0;">Patient Summary</h4>
-                <p><b>Age:</b> {age} years</p>
-                <p><b>BMI:</b> {bmi}</p>
-                <p><b>Plasma Glucose:</b> {glucose} mg/dL</p>
-                <p><b>Blood Pressure:</b> {bp} mm Hg</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # -----------------------------------------
-    # Tab 2: Engineered Features
-    # -----------------------------------------
-    with tab2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("""
-        <div class="glass-card">
-            <h4>Automated Feature Interactions</h4>
-            <p>The Random Forest model dynamically engineered the following clinical parameters to enhance interpretability:</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Glucose-BMI Interaction", f"{df_input['Glucose_BMI_interaction'].values[0]:.1f}")
-        c2.metric("Insulin-Glucose Ratio", f"{df_input['Insulin_Glucose_ratio'].values[0]:.4f}")
-        c3.metric("Genetic Age Exposure", f"{df_input['Genetic_Age_exposure'].values[0]:.2f}")
-
-    # -----------------------------------------
-    # Tab 3: Report Generation
-    # -----------------------------------------
-    with tab3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.info("Generating professional medical assessment document...")
-        
-        # ReportLab PDF Generation
-        pdf_filename = "Clinical_Risk_Report.pdf"
-        doc = SimpleDocTemplate(pdf_filename, pagesize=letter)
-        styles = getSampleStyleSheet()
-        story = [
-            Paragraph("Clinical Metabolic Risk & XAI Report", ParagraphStyle('Title', parent=styles['Heading1'], fontSize=16, textColor=colors.HexColor('#1f77b4'))),
-            Spacer(1, 10),
-            Paragraph(f"Assessment: {'High Risk' if prediction == 1 else 'Low Risk'} ({prob*100:.2f}% Probability)", styles['Normal']),
-            Spacer(1, 15)
-        ]
-        
-        vitals_table_data = [["Parameter", "Value"]] + [[k, str(v)] for k, v in input_data.items()]
-        t = Table(vitals_table_data, colWidths=[200, 200])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (1,0), colors.HexColor('#0f172a')),
-            ('TEXTCOLOR', (0,0), (1,0), colors.whitesmoke),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-        ]))
-        story.append(t)
-        doc.build(story)
-
-        with open(pdf_filename, "rb") as pdf_file:
-            st.download_button(
-                label="📥 Download Secure Clinical PDF Report",
-                data=pdf_file,
-                file_name="Clinical_Risk_Report.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
+st.subheader("🎯 Model Diagnostic Assessment")
+if risk_proba > 0.5:
+    st.error(f"**High Risk Detected** — Estimated Metabolic Syndrome / High Glucose Probability: **{risk_proba:.2%}**")
 else:
-    # Empty state UI
-    st.info("👈 Enter patient vitals in the sidebar and click 'Run AI Diagnostic' to begin analysis.")
+    st.success(f"**Low Risk Status** — Estimated Metabolic Syndrome Probability: **{risk_proba:.2%}**")
+
+st.markdown("---")
+
+# Generative AI Narrative Section
+st.subheader("🤖 Generative AI Clinical Reports (Gemini Powered)")
+if st.button("Generate Dual-Persona Clinical Narrative"):
+    if not api_key_input:
+        st.warning("Please enter your Gemini API key in the sidebar configuration.")
+    else:
+        with st.spinner("Analyzing patient telemetry and querying Gemini API..."):
+            try:
+                client = genai.Client(api_key=api_key_input)
+                
+                top_features = selected_patient_row.to_dict()
+                telemetry_payload = {
+                    "patient_id": int(df_data.iloc[patient_idx]['SEQN']) if 'SEQN' in df_data.columns else patient_idx,
+                    "risk_probability": round(float(risk_proba), 2),
+                    "patient_vitals": top_features
+                }
+                
+                prompt = f"""
+                You are an autonomous clinical decision support system adhering strictly to American Diabetes Association (ADA) standards. Analyze this telemetry:
+                {telemetry_payload}
+                
+                Provide:
+                1. DOCTOR VIEW: Structured SOAP Note (Subjective, Objective, Assessment, Plan) with clinical justification.
+                2. PATIENT VIEW: Empathetic, plain-language actionable guidance avoiding complex jargon.
+                """
+                
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction="You are a rigorous clinical AI assistant providing evidence-based medical summaries.",
+                        temperature=0.2,
+                    ),
+                )
+                
+                st.markdown(response.text)
+                
+            except Exception as e:
+                st.error(f"Error connecting to Gemini API: {e}")
