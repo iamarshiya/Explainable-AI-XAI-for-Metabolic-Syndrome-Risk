@@ -37089,10 +37089,10 @@
 /***/ })
 /******/ ]);
 //# sourceMappingURL=bundle.js.map </script></head><body>
-        <div class="lime top_div" id="top_divDC1JRN2FW882O1Z"></div>
+        <div class="lime top_div" id="top_divNFI3D2K5Q6OZE7E"></div>
         
         <script>
-        var top_div = d3.select('#top_divDC1JRN2FW882O1Z').classed('lime top_div', true);
+        var top_div = d3.select('#top_divNFI3D2K5Q6OZE7E').classed('lime top_div', true);
         
             var pp_div = top_div.append('div')
                                 .classed('lime predict_proba', true);
@@ -37104,10 +37104,10 @@
             var exp = new lime.Explanation(["Low Risk", "High Risk"]);
         
                 exp_div = top_div.append('div').classed('lime explanation', true);
-                exp.show([["Insulin > 15.69", 0.19393063809001188], ["Age > 62.25", 0.10314231569719574], ["118.00 < BloodPressure <= 132.00", 0.07311947796362558], ["BP_Age_ratio <= 2.07", 0.06904879855514214], ["27.45 < BMI <= 32.90", 0.002887302887388018]], 1, exp_div);
+                exp.show([["Insulin > 15.69", 0.20297104772735194], ["Age > 62.25", 0.10289380647841176], ["118.00 < BloodPressure <= 132.00", 0.06435082173030428], ["BP_Age_ratio <= 2.07", 0.059239873047465565], ["27.45 < BMI <= 32.90", -0.0007682892811009956]], 1, exp_div);
                 
         var raw_div = top_div.append('div');
-            exp.show_raw_tabular([["Insulin", "17.66", 0.19393063809001188], ["Age", "80.00", 0.10314231569719574], ["BloodPressure", "126.00", 0.07311947796362558], ["BP_Age_ratio", "1.57", 0.06904879855514214], ["BMI", "32.60", 0.002887302887388018]], 1, raw_div);
+            exp.show_raw_tabular([["Insulin", "17.66", 0.20297104772735194], ["Age", "80.00", 0.10289380647841176], ["BloodPressure", "126.00", 0.06435082173030428], ["BP_Age_ratio", "1.57", 0.059239873047465565], ["BMI", "32.60", -0.0007682892811009956]], 1, raw_div);
         
         </script>
         </body></html>

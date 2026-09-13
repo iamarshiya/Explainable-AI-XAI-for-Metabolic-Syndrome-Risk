@@ -10,6 +10,16 @@ from sklearn.metrics import classification_report, accuracy_score
 import shap
 import lime
 import lime.lime_tabular
+import os
+import matplotlib.pyplot as plt
+
+# 1. Create the output folder automatically if it doesn't exist
+os.makedirs('output_main', exist_ok=True)
+
+# 2. Right before plt.show() or st.pyplot(fig) for each graph, save it:
+# Example:
+plt.savefig('output_main/graph_name.png', bbox_inches='tight', dpi=300)
+plt.show() # or st.pyplot(fig)
 
 def fetch_nhanes_data():
     print("1. Loading NHANES Multi-Year Population Data from local 'data/' directory...")
@@ -113,8 +123,8 @@ def main():
     plt.title("SHAP Summary Plot - NHANES Global Feature Importance")
     shap.summary_plot(shap_values_risk, X_test, show=False)
     plt.tight_layout()
-    plt.savefig("shap_summary.png")
-    print(" -> Saved 'shap_summary.png'")
+    plt.savefig("output_main/shap_summary.png")
+    print(" -> Saved 'output_main/shap_summary.png'")
     plt.close()
 
     print("\n4. Generating Local Patient Explanations (Patient Index 5)...")
@@ -131,8 +141,8 @@ def main():
         shap_values_risk[patient_idx, :], 
         patient_data
     )
-    shap.save_html("patient_shap_explanation.html", shap_html)
-    print(" -> Saved 'patient_shap_explanation.html'")
+    shap.save_html("output_main/patient_shap_explanation.html", shap_html)
+    print(" -> Saved 'output_main/patient_shap_explanation.html'")
 
     print("\n5. Generating LIME Explanation...")
     lime_explainer = lime.lime_tabular.LimeTabularExplainer(
@@ -153,8 +163,8 @@ def main():
         data_row=X_test.iloc[patient_idx].values,
         predict_fn=custom_predict_proba
     )
-    exp.save_to_file('patient_lime_explanation.html')
-    print(" -> Saved 'patient_lime_explanation.html'")
+    exp.save_to_file('output_main/patient_lime_explanation.html')
+    print(" -> Saved 'output_main/patient_lime_explanation.html'")
     
     print("\nPipeline Complete! Processed real clinical NHANES population records.")
 
