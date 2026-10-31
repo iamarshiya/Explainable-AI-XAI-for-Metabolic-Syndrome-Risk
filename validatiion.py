@@ -173,12 +173,26 @@ def main():
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("3. Final Calibrated Model Holdout Evaluation...")
+    # Map short Optuna trial keys → real sklearn/lgb parameter names
+    rf_mapped = {
+        "n_estimators":     best_rf_params.get("n_est",  200),
+        "max_depth":        best_rf_params.get("max_d",  6),
+        "min_samples_split":best_rf_params.get("mss",    2),
+        "min_samples_leaf": best_rf_params.get("msl",    1),
+    }
+    lgb_mapped = {
+        "n_estimators":      best_lgb_params.get("n_est",  200),
+        "max_depth":         best_lgb_params.get("max_d",  6),
+        "num_leaves":        best_lgb_params.get("leaves", 31),
+        "learning_rate":     best_lgb_params.get("lr",     0.1),
+        "min_child_samples": best_lgb_params.get("mcs",    20),
+    }
     best_rf   = CalibratedClassifierCV(
-        RandomForestClassifier(**best_rf_params, random_state=42),
+        RandomForestClassifier(**rf_mapped, random_state=42),
         method="isotonic", cv=5
     )
     best_lgbm = CalibratedClassifierCV(
-        lgb.LGBMClassifier(**best_lgb_params, random_state=42, verbose=-1),
+        lgb.LGBMClassifier(**lgb_mapped, random_state=42, verbose=-1),
         method="isotonic", cv=5
     )
     best_rf.fit(X_tr, y_tr)
