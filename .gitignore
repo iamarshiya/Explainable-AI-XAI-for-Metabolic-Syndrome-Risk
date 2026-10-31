@@ -1,1 +1,27 @@
+# Secrets
 .env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Models (large binary — regenerate with main.py)
+model.pkl
+model_rf.pkl
+model_xgb.pkl
+model_lgb.pkl
+
+# Outputs
+output_main/
+graphs/
+clinical_narrative_output.txt
+Clinical_Risk_Report.pdf
+feature_importance_comparison.png
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,99 +1,150 @@
-import pandas as pd
+"""
+MetaRisk XAI — Feature Importance Comparison (Upgraded)
+=========================================================
+Models: Random Forest, XGBoost, LightGBM
+Metrics: Gini, SHAP, Mutual Information
+"""
+
+import os
+import warnings
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
+import shap
+import lightgbm as lgb
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import mutual_info_classif
-import shap
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
 
-def prepare_clinical_data(df_raw):
-    df_feat = df_raw.copy()
-    
-    # Handle implicit zeros via median imputation
-    zero_cols = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
-    for col in zero_cols:
-        df_feat[col] = df_feat[col].replace(0, np.nan)
-        df_feat[col] = df_feat[col].fillna(df_feat.groupby('Outcome')[col].transform('median'))
-    
-    eps = 1e-6
-    # Composite Clinical Risk Features
-    df_feat['Glucose_BMI_interaction'] = df_feat['Glucose'] * df_feat['BMI']
-    df_feat['Insulin_Glucose_ratio'] = df_feat['Insulin'] / (df_feat['Glucose'] + eps)
-    df_feat['Genetic_Age_exposure'] = df_feat['DiabetesPedigreeFunction'] * df_feat['Age']
-    df_feat['BP_Age_ratio'] = df_feat['BloodPressure'] / (df_feat['Age'] + eps)
-    
-    return df_feat
+warnings.filterwarnings("ignore")
+os.makedirs("output_main", exist_ok=True)
+
+EPS = 1e-6
+
+
+def fetch_nhanes_data():
+    data_dir = "data"
+
+    def _path(name):
+        for ext in (".xpt", ".XPT"):
+            p = os.path.join(data_dir, name + ext)
+            if os.path.exists(p):
+                return p
+        raise FileNotFoundError(f"Missing {name} in data/")
+
+    df_demo = pd.read_sas(_path("DEMO_J"))[["SEQN", "RIDAGEYR", "RIAGENDR"]]
+    df_bmx  = pd.read_sas(_path("BMX_J"))[["SEQN", "BMXBMI"]]
+    df_bpx  = pd.read_sas(_path("BPX_J"))[["SEQN", "BPXSY1"]]
+    df_glu  = pd.read_sas(_path("GLU_J"))[["SEQN", "LBXGLU"]]
+    df_ins  = pd.read_sas(_path("INS_J"))[["SEQN", "LBXIN"]]
+
+    df = (df_demo
+          .merge(df_bmx, on="SEQN", how="inner")
+          .merge(df_bpx, on="SEQN", how="inner")
+          .merge(df_glu, on="SEQN", how="inner")
+          .merge(df_ins, on="SEQN", how="left"))
+
+    df.rename(columns={"RIDAGEYR": "Age", "RIAGENDR": "Gender",
+                       "BMXBMI": "BMI", "BPXSY1": "BloodPressure",
+                       "LBXGLU": "Glucose", "LBXIN": "Insulin"}, inplace=True)
+
+    for col in ["Glucose", "BloodPressure", "Insulin", "BMI", "Age"]:
+        df[col] = df[col].replace(0, np.nan).fillna(df[col].median())
+
+    # ATP-III proxy label
+    crit_bp  = (df["BloodPressure"] >= 130).astype(int)
+    crit_glu = (df["Glucose"] >= 100).astype(int)
+    crit_bmi = (df["BMI"] >= 27.5).astype(int)
+    crit_ins = (df["Insulin"] >= 25).astype(int)
+    df["Outcome"] = ((crit_bp + crit_glu + crit_bmi + crit_ins) >= 2).astype(int)
+
+    df["Glucose_BMI_interaction"] = df["Glucose"] * df["BMI"]
+    df["Insulin_Glucose_ratio"]   = df["Insulin"] / (df["Glucose"] + EPS)
+    df["BP_Age_ratio"]            = df["BloodPressure"] / (df["Age"] + EPS)
+    df["BMI_Age_interaction"]     = df["BMI"] * df["Age"]
+    df["Insulin_BMI_interaction"] = df["Insulin"] * df["BMI"]
+
+    df.drop(columns=["SEQN", "Gender", "Glucose"], inplace=True, errors="ignore")
+    return df
+
 
 def main():
-    print("1. Preparing Data and Training Model...")
-    url = "https://raw.githubusercontent.com/plotly/datasets/master/diabetes.csv"
-    df = pd.read_csv(url)
-    df_clean = prepare_clinical_data(df)
+    print("=== Feature Importance Comparison: Gini vs SHAP vs Mutual Information ===\n")
 
-    X = df_clean.drop(columns=['Outcome'])
-    y = df_clean['Outcome']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    df = fetch_nhanes_data()
+    X = df.drop(columns=["Outcome"])
+    y = df["Outcome"]
 
-    rf_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-    rf_model.fit(X_train, y_train)
+    X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.2,
+                                                    stratify=y, random_state=42)
 
-    print("\n2. Computing Feature Importance Metrics...")
-    # Metric 1: Gini Importance (Model-centric)
-    gini_imp = rf_model.feature_importances_
+    # ── Train all 3 models ────────────────────────────────────────────────────
+    rf  = RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42)
+    xgb = XGBClassifier(n_estimators=200, max_depth=5, eval_metric="logloss", random_state=42)
+    lgbm = lgb.LGBMClassifier(n_estimators=200, max_depth=5, random_state=42, verbose=-1)
 
-    # Metric 2: SHAP Importance (Prediction-centric)
-    explainer = shap.TreeExplainer(rf_model)
-    shap_values = explainer.shap_values(X_test)
-    
-    if isinstance(shap_values, list):
-        shap_values_risk = shap_values[1]
-    elif len(shap_values.shape) == 3:
-        shap_values_risk = shap_values[:, :, 1]
-    else:
-        shap_values_risk = shap_values
+    rf.fit(X_train, y_train)
+    xgb.fit(X_train, y_train)
+    lgbm.fit(X_train, y_train)
 
-    shap_imp = np.abs(shap_values_risk).mean(axis=0)
+    # ── SHAP for each model ───────────────────────────────────────────────────
+    def _shap_mean(model, X_t):
+        exp = shap.TreeExplainer(model)
+        sv  = exp.shap_values(X_t)
+        if isinstance(sv, list):
+            sv = sv[1]
+        elif sv.ndim == 3:
+            sv = sv[:, :, 1]
+        return np.abs(sv).mean(axis=0)
 
-    # Metric 3: Mutual Information (Data-centric / Statistical)
-    mi_imp = mutual_info_classif(X_train, y_train, random_state=42)
+    shap_rf  = _shap_mean(rf,   X_test)
+    shap_xgb = _shap_mean(xgb,  X_test)
+    shap_lgb = _shap_mean(lgbm, X_test)
 
-    print("\n3. Constructing Comparison Table...")
+    # ── Mutual Information ────────────────────────────────────────────────────
+    mi = mutual_info_classif(X_train, y_train, random_state=42)
+
+    # ── Normalise ─────────────────────────────────────────────────────────────
+    def _norm(arr):
+        rng = arr.max() - arr.min()
+        return (arr - arr.min()) / rng if rng > 0 else arr
+
     comp_df = pd.DataFrame({
-        'Feature': X.columns,
-        'Gini_Importance': gini_imp,
-        'SHAP_Importance': shap_imp,
-        'Mutual_Information': mi_imp
-    })
+        "Feature":           list(X.columns),
+        "Gini (RF)":         _norm(rf.feature_importances_),
+        "SHAP (RF)":         _norm(shap_rf),
+        "SHAP (XGB)":        _norm(shap_xgb),
+        "SHAP (LGB)":        _norm(shap_lgb),
+        "Mutual_Information":_norm(mi),
+    }).sort_values("SHAP (RF)", ascending=False)
 
-    # Normalize scores to 0.0 - 1.0 scale for direct comparison
-    for col in ['Gini_Importance', 'SHAP_Importance', 'Mutual_Information']:
-        comp_df[f'{col}_Norm'] = comp_df[col] / comp_df[col].max()
+    print(comp_df.to_string(index=False))
 
-    comp_df = comp_df.sort_values(by='SHAP_Importance_Norm', ascending=False)
-    print("\nNormalized Importance Comparison:\n")
-    print(comp_df[['Feature', 'Gini_Importance_Norm', 'SHAP_Importance_Norm', 'Mutual_Information_Norm']].to_string(index=False))
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    n_feat = len(comp_df)
+    x      = np.arange(n_feat)
+    width  = 0.15
 
-    print("\n4. Generating Comparative Bar Chart Plot...")
-    plt.figure(figsize=(12, 6))
-    x_axis = np.arange(len(comp_df))
-    width = 0.25
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.bar(x - 2*width, comp_df["Gini (RF)"],          width, label="Gini (RF)",          color="#6366f1")
+    ax.bar(x - 1*width, comp_df["SHAP (RF)"],          width, label="SHAP (RF)",          color="#f59e0b")
+    ax.bar(x,            comp_df["SHAP (XGB)"],         width, label="SHAP (XGB)",         color="#10b981")
+    ax.bar(x + 1*width, comp_df["SHAP (LGB)"],          width, label="SHAP (LightGBM)",    color="#ef4444")
+    ax.bar(x + 2*width, comp_df["Mutual_Information"],  width, label="Mutual Information", color="#8b5cf6")
 
-    plt.bar(x_axis - width, comp_df['Gini_Importance_Norm'], width=width, label='Gini Importance (Tree Split)', color='#1f77b4')
-    plt.bar(x_axis, comp_df['SHAP_Importance_Norm'], width=width, label='SHAP Score (Impact on Prediction)', color='#ff7f0e')
-    plt.bar(x_axis + width, comp_df['Mutual_Information_Norm'], width=width, label='Mutual Information (Statistical Risk)', color='#2ca02c')
-
-    plt.xticks(x_axis, comp_df['Feature'], rotation=45, ha='right')
-    plt.ylabel('Normalized Score (0.0 - 1.0)')
-    plt.title('Feature Importance Metric Comparison: Gini vs. SHAP vs. Mutual Information')
-    plt.legend()
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(comp_df["Feature"], rotation=40, ha="right")
+    ax.set_ylabel("Normalised Score (0–1)")
+    ax.set_title("Feature Importance: Gini vs SHAP (RF/XGB/LGB) vs Mutual Information")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
     plt.tight_layout()
-    
-    plot_filename = "feature_importance_comparison.png"
-    plt.savefig(plot_filename, dpi=300)
-    print(f" -> Saved comparative plot as '{plot_filename}'")
+    plt.savefig("output_main/feature_importance_comparison.png", dpi=200, bbox_inches="tight")
+    print("\n -> Saved output_main/feature_importance_comparison.png")
     plt.show()
+
 
 if __name__ == "__main__":
     main()
