@@ -34,3 +34,8 @@ python-dotenv>=1.0.0
 joblib>=1.3.0
 matplotlib>=3.8.0
 seaborn>=0.13.0
+
+#Frontend
+fastapi
+uvicorn[standard]
+python-multipart

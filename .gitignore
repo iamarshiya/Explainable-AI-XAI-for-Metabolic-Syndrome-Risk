@@ -1,21 +1,48 @@
-# Secrets
+# ─── Secrets ─────────────────────────────────────────────────
 .env
+.env.local
 .streamlit/secrets.toml
+frontend/.env.local
+Frontend/.env.local
 
-# Python
+# ─── Python ──────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
 venv/
 .venv/
+env/
 
-# Models (large binary — regenerate with main.py)
+# ─── Models (large binaries — regenerate with main.py) ───────
 model.pkl
 model_rf.pkl
 model_xgb.pkl
 model_lgb.pkl
+*.pkl
 
+# ─── Python outputs ──────────────────────────────────────────
+output_main/
+graphs/
+clinical_narrative_output.txt
+Clinical_Risk_Report.pdf
+feature_importance_comparison.png
 
-# OS
+# ─── Node / Next.js  (CRITICAL) ──────────────────────────────
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+**/out/
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ─── Editor / OS ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+*.swp

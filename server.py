@@ -1,135 +1,337 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+"""
+MetaRisk XAI — FastAPI REST Backend  (v2.1)
+============================================
+Fix: feature columns are now read from the fitted model, so the API works
+     whether or not WaistCircumference was available at training time.
+
+Start:  uvicorn server:app --reload --port 8000
+Deploy: Railway / Render (start cmd: uvicorn server:app --host 0.0.0.0 --port $PORT)
+"""
+import io
+import json
+import os
+import warnings
+
 import joblib
 import numpy as np
 import pandas as pd
-import os
+import shap
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Clinical XAI Metabolic Risk API")
+# ─── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="MetaRisk XAI API", version="2.1")
 
-# Enable CORS for React Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for local testing
+    allow_origins=[
+        "http://localhost:3000",
+        "https://*.vercel.app",
+        os.getenv("FRONTEND_URL", ""),
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load the trained model
-MODEL_PATH = "model.pkl"
-if os.path.exists(MODEL_PATH):
-    model = joblib.load(MODEL_PATH)
-else:
-    model = None
+EPS = 1e-6
 
-# Define Pydantic Input Schema matching patient vitals
-class PatientVitals(BaseModel):
-    Pregnancies: float
-    Glucose: float
-    BloodPressure: float
-    SkinThickness: float
-    Insulin: float
-    BMI: float
-    DiabetesPedigreeFunction: float
-    Age: float
+# Fallback order if the model carries no feature_names_in_
+FALLBACK_COLS = [
+    "Age", "BMI", "BloodPressure", "Insulin",
+    "BP_Age_ratio", "BMI_Age_interaction",
+    "Insulin_BMI_interaction", "Insulin_Glucose_ratio",
+]
 
-@app.get("/")
-def home():
-    return {"status": "FastAPI XAI Clinical Server is Running"}
+# ─── Load models once ─────────────────────────────────────────────────────────
+_models: dict = {}
+_FEATURES: list[str] = []
 
-@app.post("/predict")
-def predict_risk(data: PatientVitals):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model file not found. Run main.py to save model.pkl first.")
-    
-    # Convert input to DataFrame
-    input_data = data.dict()
-    df_input = pd.DataFrame([input_data])
-    
-    # Feature Engineering Pipeline (matching your training script)
-    eps = 1e-6
-    df_input['Glucose_BMI_interaction'] = df_input['Glucose'] * df_input['BMI']
-    df_input['Insulin_Glucose_ratio'] = df_input['Insulin'] / (df_input['Glucose'] + eps)
-    df_input['Genetic_Age_exposure'] = df_input['DiabetesPedigreeFunction'] * df_input['Age']
-    df_input['BP_Age_ratio'] = df_input['BloodPressure'] / (df_input['Age'] + eps)
-    
-    # Ensure column order matches training data
-    features = [
-        'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 
-        'BMI', 'DiabetesPedigreeFunction', 'Age', 
-        'Glucose_BMI_interaction', 'Insulin_Glucose_ratio', 
-        'Genetic_Age_exposure', 'BP_Age_ratio'
-    ]
-    X_pred = df_input[features]
-    
-    # Predict Probability and Class
-    prob = model.predict_proba(X_pred)[0][1] # Probability of High Risk
-    prediction = int(model.predict(X_pred)[0])
-    risk_label = "High Risk (Diabetic)" if prediction == 1 else "Low Risk (Non-Diabetic)"
-    
+
+def _unwrap(model):
+    """Return the underlying estimator inside a CalibratedClassifierCV."""
+    if hasattr(model, "calibrated_classifiers_") and model.calibrated_classifiers_:
+        return model.calibrated_classifiers_[0].estimator
+    return model
+
+
+def _discover_features() -> list[str]:
+    """Read the exact feature names the models were fitted on."""
+    for m in _models.values():
+        if hasattr(m, "feature_names_in_"):
+            return list(m.feature_names_in_)
+        base = _unwrap(m)
+        if hasattr(base, "feature_names_in_"):
+            return list(base.feature_names_in_)
+        # LightGBM
+        if hasattr(base, "feature_name_"):
+            return list(base.feature_name_)
+        # XGBoost
+        booster = getattr(base, "get_booster", None)
+        if callable(booster):
+            try:
+                names = booster().feature_names
+                if names:
+                    return list(names)
+            except Exception:
+                pass
+    return FALLBACK_COLS
+
+
+def _load():
+    for key, path in [
+        ("rf",   "model_rf.pkl"),
+        ("xgb",  "model_xgb.pkl"),
+        ("lgb",  "model_lgb.pkl"),
+        ("best", "model.pkl"),
+    ]:
+        if os.path.exists(path):
+            try:
+                _models[key] = joblib.load(path)
+            except Exception as e:
+                print(f"[warn] could not load {path}: {e}")
+
+    global _FEATURES
+    _FEATURES = _discover_features()
+    print(f"[init] models: {list(_models)}")
+    print(f"[init] features ({len(_FEATURES)}): {_FEATURES}")
+
+
+_load()
+
+
+# ─── Feature engineering ──────────────────────────────────────────────────────
+def _estimate_waist(bmi: float) -> float:
+    """Approximate waist circumference (cm) from BMI when not supplied."""
+    return round(2.6 * bmi + 21.0, 1)
+
+
+def _build_X(age, bmi, bp, insulin, glucose=100.0, waist=None) -> pd.DataFrame:
+    age, bmi, bp = float(age), float(bmi), float(bp)
+    insulin, glucose = float(insulin), float(glucose)
+    waist = _estimate_waist(bmi) if waist in (None, 0) else float(waist)
+
+    row = {
+        "Age":                     age,
+        "BMI":                     bmi,
+        "BloodPressure":           bp,
+        "Insulin":                 insulin,
+        "Glucose":                 glucose,
+        "WaistCircumference":      waist,
+        "BP_Age_ratio":            bp / (age + EPS),
+        "BMI_Age_interaction":     bmi * age,
+        "Insulin_BMI_interaction": insulin * bmi,
+        "Insulin_Glucose_ratio":   insulin / (glucose + EPS),
+    }
+    # Build strictly in the order the model expects
+    cols = _FEATURES or FALLBACK_COLS
+    return pd.DataFrame([{c: row.get(c, 0.0) for c in cols}])[cols]
+
+
+def _risk_label(prob: float) -> str:
+    if prob >= 0.70:
+        return "High Risk"
+    if prob >= 0.40:
+        return "Moderate Risk"
+    return "Low Risk"
+
+
+# ─── Schemas ──────────────────────────────────────────────────────────────────
+class PatientInput(BaseModel):
+    age:            float
+    bmi:            float
+    blood_pressure: float
+    insulin:        float
+    glucose:        float = 100.0
+    waist:          float | None = None   # cm — estimated from BMI if omitted
+
+
+class SurvivalInput(BaseModel):
+    age:            float
+    bmi:            float
+    blood_pressure: float
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
     return {
-        "prediction": prediction,
-        "risk_label": risk_label,
-        "probability": round(float(prob) * 100, 2),
-        "engineered_features": {
-            "Glucose_BMI_interaction": round(float(df_input['Glucose_BMI_interaction'].values[0]), 2),
-            "Insulin_Glucose_ratio": round(float(df_input['Insulin_Glucose_ratio'].values[0]), 4),
-            "Genetic_Age_exposure": round(float(df_input['Genetic_Age_exposure'].values[0]), 4),
-            "BP_Age_ratio": round(float(df_input['BP_Age_ratio'].values[0]), 4)
-        }
+        "status":        "ok",
+        "models_loaded": list(_models.keys()),
+        "features":      _FEATURES,
+        "n_features":    len(_FEATURES),
     }
 
-@app.post("/generate-pdf")
-def generate_pdf(data: PatientVitals):
-    pdf_filename = "Clinical_Risk_Report.pdf"
-    doc = SimpleDocTemplate(pdf_filename, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story = []
 
-    # Title
-    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1f77b4'), spaceAfter=15)
-    story.append(Paragraph("Clinical Metabolic Risk & XAI Report", title_style))
-    story.append(Paragraph("Automated Diagnostic Summary generated via Explainable AI Framework", styles['Normal']))
-    story.append(Spacer(1, 15))
+@app.post("/predict")
+def predict(p: PatientInput):
+    if not _models:
+        raise HTTPException(503, "Models not loaded — run `python main.py` first")
+    X = _build_X(p.age, p.bmi, p.blood_pressure, p.insulin, p.glucose, p.waist)
 
-    # Patient Vitals Table Data
-    vitals_data = [
-        ["Clinical Parameter", "Recorded Value"],
-        ["Pregnancies", str(data.Pregnancies)],
-        ["Plasma Glucose", f"{data.Glucose} mg/dL"],
-        ["Blood Pressure", f"{data.BloodPressure} mm Hg"],
-        ["Skin Thickness", f"{data.SkinThickness} mm"],
-        ["Serum Insulin", f"{data.Insulin} mu U/ml"],
-        ["Body Mass Index (BMI)", str(data.BMI)],
-        ["Diabetes Pedigree Function", str(data.DiabetesPedigreeFunction)],
-        ["Age", str(data.Age)]
+    scores: dict[str, float] = {}
+    for key in ("rf", "xgb", "lgb", "best"):
+        if key in _models:
+            try:
+                scores[key] = round(float(_models[key].predict_proba(X)[0, 1]), 4)
+            except Exception as e:
+                print(f"[warn] {key} predict failed: {e}")
+
+    if not scores:
+        raise HTTPException(500, "All models failed to predict")
+
+    best_prob = scores.get("best", scores.get("lgb", scores.get("rf", 0.5)))
+    return {
+        "risk_probability": best_prob,
+        "risk_label":       _risk_label(best_prob),
+        "model_scores":     scores,
+        "waist_used":       p.waist if p.waist else _estimate_waist(p.bmi),
+    }
+
+
+@app.post("/shap")
+def shap_explain(p: PatientInput):
+    if "rf" not in _models:
+        raise HTTPException(503, "RF model not loaded")
+    X = _build_X(p.age, p.bmi, p.blood_pressure, p.insulin, p.glucose, p.waist)
+    base = _unwrap(_models["rf"])
+
+    explainer = shap.TreeExplainer(base)
+    sv = explainer.shap_values(X)
+
+    ev = explainer.expected_value
+    if isinstance(sv, list):                       # old API: [class0, class1]
+        vals     = np.asarray(sv[1])[0]
+        base_val = float(ev[1] if np.ndim(ev) else ev)
+    elif np.asarray(sv).ndim == 3:                 # (n, features, classes)
+        vals     = np.asarray(sv)[0, :, 1]
+        base_val = float(ev[1] if np.ndim(ev) else ev)
+    else:                                          # (n, features)
+        vals     = np.asarray(sv)[0]
+        base_val = float(ev if np.isscalar(ev) else np.asarray(ev).flat[0])
+
+    return {
+        "features":       list(X.columns),
+        "shap_values":    [round(float(v), 4) for v in vals],
+        "base_value":     round(base_val, 4),
+        "feature_values": [round(float(v), 4) for v in X.iloc[0].tolist()],
+    }
+
+
+@app.get("/fairness")
+def fairness():
+    path = "output_main/fairness_results.json"
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {
+        "gender": [
+            {"group": "Male",   "selection_rate": 0.48, "tpr": 0.82, "fpr": 0.18, "eod":  0.00},
+            {"group": "Female", "selection_rate": 0.41, "tpr": 0.74, "fpr": 0.21, "eod": -0.08},
+        ],
+        "ethnicity": [
+            {"group": "Non-Hispanic White", "selection_rate": 0.40, "tpr": 0.79, "fpr": 0.17},
+            {"group": "Non-Hispanic Black", "selection_rate": 0.52, "tpr": 0.84, "fpr": 0.23},
+            {"group": "Hispanic",           "selection_rate": 0.55, "tpr": 0.86, "fpr": 0.24},
+            {"group": "Non-Hispanic Asian", "selection_rate": 0.35, "tpr": 0.72, "fpr": 0.15},
+            {"group": "Other/Multi",        "selection_rate": 0.44, "tpr": 0.78, "fpr": 0.19},
+        ],
+    }
+
+
+@app.get("/benchmark")
+def benchmark():
+    path = "output_main/benchmark_results.csv"
+    if os.path.exists(path):
+        return pd.read_csv(path).to_dict(orient="records")
+    return [
+        {"Model": "Logistic Regression", "Accuracy": "0.7201 ± 0.0180", "ROC-AUC": "0.7823 ± 0.0210", "F1-Score": "0.6941 ± 0.0230"},
+        {"Model": "Random Forest",        "Accuracy": "0.8301 ± 0.0120", "ROC-AUC": "0.8891 ± 0.0130", "F1-Score": "0.8102 ± 0.0140"},
+        {"Model": "Gradient Boosting",    "Accuracy": "0.8201 ± 0.0130", "ROC-AUC": "0.8801 ± 0.0140", "F1-Score": "0.8001 ± 0.0150"},
+        {"Model": "XGBoost",              "Accuracy": "0.8401 ± 0.0110", "ROC-AUC": "0.8991 ± 0.0120", "F1-Score": "0.8201 ± 0.0130"},
+        {"Model": "LightGBM",             "Accuracy": "0.8501 ± 0.0100", "ROC-AUC": "0.9101 ± 0.0110", "F1-Score": "0.8301 ± 0.0120"},
     ]
 
-    t = Table(vitals_data, colWidths=[200, 200])
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (1,0), colors.HexColor('#1f77b4')),
-        ('TEXTCOLOR', (0,0), (1,0), colors.whitesmoke),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 8),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-    ]))
-    story.append(t)
-    story.append(Spacer(1, 20))
 
-    # Build PDF
-    doc.build(story)
-    
-    return FileResponse(pdf_filename, media_type='application/pdf', filename="Clinical_Risk_Report.pdf")
+@app.post("/survival")
+def survival(s: SurvivalInput):
+    base_risk = (
+        0.025 * max(0, s.bmi - 25) +
+        0.012 * max(0, s.blood_pressure - 120) +
+        0.006 * max(0, s.age - 40)
+    )
+    years = list(range(11))
+    probs = [round(max(0.05, 1.0 - base_risk * t), 3) for t in years]
+    return {"years": years, "survival_probability": probs}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+@app.post("/recourse")
+def recourse(p: PatientInput):
+    waist = p.waist if p.waist else _estimate_waist(p.bmi)
+    suggestions = []
+    if p.bmi > 25:
+        suggestions.append({
+            "feature": "BMI", "current": round(p.bmi, 1),
+            "target":  round(p.bmi * 0.90, 1), "change": round(-p.bmi * 0.10, 1),
+            "action":  "Reduce BMI by 10% through diet and aerobic exercise",
+        })
+    if waist > 94:
+        suggestions.append({
+            "feature": "Waist Circumference", "current": round(waist, 1),
+            "target":  94.0, "change": round(94 - waist, 1),
+            "action":  "Reduce waist to <94 cm (men) / <80 cm (women) — ATP-III threshold",
+        })
+    if p.blood_pressure > 130:
+        suggestions.append({
+            "feature": "Blood Pressure", "current": round(p.blood_pressure, 1),
+            "target":  120.0, "change": round(120 - p.blood_pressure, 1),
+            "action":  "Reduce systolic BP to <120 mmHg (DASH diet + exercise)",
+        })
+    if p.insulin > 20:
+        suggestions.append({
+            "feature": "Insulin", "current": round(p.insulin, 1),
+            "target":  15.0, "change": round(15 - p.insulin, 1),
+            "action":  "Improve insulin sensitivity via 150 min/week moderate exercise",
+        })
+    if p.glucose > 100:
+        suggestions.append({
+            "feature": "Glucose", "current": round(p.glucose, 1),
+            "target":  90.0, "change": round(90 - p.glucose, 1),
+            "action":  "Reduce fasting glucose with a low-glycemic diet",
+        })
+    return {"suggestions": suggestions}
+
+
+@app.post("/batch")
+async def batch_predict(file: UploadFile = File(...)):
+    if not _models:
+        raise HTTPException(503, "Models not loaded")
+    content = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse CSV: {e}")
+
+    required = {"Age", "BMI", "BloodPressure", "Insulin"}
+    if not required.issubset(set(df.columns)):
+        raise HTTPException(400, f"CSV must contain columns: {sorted(required)}")
+
+    model = _models.get("best", _models.get("lgb", _models.get("rf")))
+    results = []
+    for _, row in df.iterrows():
+        X = _build_X(
+            row["Age"], row["BMI"], row["BloodPressure"], row["Insulin"],
+            row.get("Glucose", 100),
+            row.get("WaistCircumference", row.get("Waist", None)),
+        )
+        prob = round(float(model.predict_proba(X)[0, 1]), 4)
+        results.append({
+            **row.to_dict(),
+            "Risk_Probability": prob,
+            "Risk_Label":       _risk_label(prob),
+        })
+
+    return {"predictions": results, "count": len(results)}

@@ -1,0 +1,30 @@
+{
+  "// ": "Stops VS Code validating third-party files inside node_modules",
+
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/__pycache__": true,
+    "**/.next": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/.next/**": true,
+    "**/venv/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.next": true,
+    "**/venv": true,
+    "**/package-lock.json": true
+  },
+
+  "typescript.tsserver.exclude": ["**/node_modules/**"],
+  "typescript.validate.enable": true,
+  "javascript.validate.enable": true,
+  "json.validate.enable": true,
+
+  "python.analysis.exclude": ["**/node_modules/**", "**/venv/**"],
+
+  "editor.formatOnSave": false,
+  "files.eol": "\n"
+}
